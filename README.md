@@ -13,7 +13,7 @@ Instead of manually submitting jobs one by one and hunting through the JES spool
 
 ## Included Test Workload: The COBOL Audit Pipeline
 
-This repository includes a file named `audit_pipeline.jcl`. While you can use this Python script to run any JCL job, this specific file is included as a complex test case to prove the engine's capabilities. 
+This repository includes a file named `test_audit_pipeline.jcl`. While you can use this Python script to run any JCL job, this specific file is included as a complex test case to prove the engine's capabilities. 
 
 Rather than testing with a simple dummy program, `audit_pipeline.jcl` is a full 3-step Compile, Link, and Go (IGYWCLG) procedure containing inline Enterprise COBOL source code and instream data. 
 
@@ -32,4 +32,4 @@ We include this heavy workload to demonstrate that the Python runner can success
 You can pass a mix of local JCL files and remote mainframe datasets to the script at the same time:
 
 ```bash
-python automate_job.py .\audit_pipeline.jcl "Z83220.JCL(TESTJOB)" "ZXP.PUBLIC.JCL(IEFBR14)"
+python automate_job.py .\test_audit_pipeline.jcl "ZXXXXX.JCL(TESTJOB)" "ZXP.PUBLIC.JCL(IEFBR14)"
