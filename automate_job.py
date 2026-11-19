@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -12,9 +13,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TERMINAL_STATUSES = {"OUTPUT", "COMPLETED"}
 POLL_INTERVAL_SECONDS = 5
+ZOWE_COMMAND_TIMEOUT_SECONDS = 120
+DEFAULT_JOB_TIMEOUT_SECONDS = 3600
+DEFAULT_MAX_WORKERS = 4
 
 
-def run_zowe(args):
+def positive_int(value):
+    """Parse a positive integer for CLI options."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def positive_float(value):
+    """Parse a positive number of seconds for CLI options."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return parsed
+
+
+def run_zowe(args, timeout=ZOWE_COMMAND_TIMEOUT_SECONDS):
     """Run a Zowe CLI command and return its standard output."""
     command = ["zowe.cmd"] + args
     try:
@@ -23,6 +49,7 @@ def run_zowe(args):
             check=True,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
@@ -32,6 +59,10 @@ def run_zowe(args):
         detail = (exc.stderr or exc.stdout or str(exc)).strip()
         raise RuntimeError(
             f"Zowe command failed ({' '.join(command)}): {detail}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Zowe command timed out after {timeout:g} seconds: {' '.join(command)}"
         ) from exc
     return result.stdout.strip()
 
@@ -87,27 +118,57 @@ def extract_retcode(output):
     return retcode if retcode else "UNKNOWN"
 
 
-def process_job(job_target):
+def process_job(job_target, job_timeout_seconds):
     """Submit a single job, monitor it, extract the return code, and download the spool."""
-    is_local_file = Path(job_target).is_file()
-    
-    if is_local_file:
-        print(f"-> Submitting local file: {job_target}")
-        submit_output = run_zowe(["jobs", "submit", "local-file", str(job_target), "--rfj"])
+    explicit_dataset = job_target.startswith("dsn:")
+    explicit_file = job_target.startswith("file:")
+    target_text = job_target[5:] if explicit_file else job_target
+    target_path = Path(target_text).expanduser()
+
+    if explicit_dataset or (not explicit_file and not target_path.exists()):
+        dataset = job_target[4:].strip() if explicit_dataset else job_target
+        if not dataset:
+            raise ValueError("Dataset target is empty.")
+        print(f"-> Submitting mainframe dataset: {dataset}")
+        submit_output = run_zowe(
+            ["jobs", "submit", "data-set", dataset, "--rfj"]
+        )
     else:
-        print(f"-> Submitting mainframe dataset: {job_target}")
-        submit_output = run_zowe(["jobs", "submit", "data-set", str(job_target), "--rfj"])
-        
+        if not target_path.is_file():
+            raise FileNotFoundError(
+                f"Local JCL target is not a file: {target_path}"
+            )
+        print(f"-> Submitting local file: {job_target}")
+        submit_output = run_zowe(
+            ["jobs", "submit", "local-file", str(target_path), "--rfj"]
+        )
+
     job_id = extract_job_id(submit_output)
     print(f"[{job_id}] Submitted successfully.")
 
-    # Poll for completion
+    deadline = time.monotonic() + job_timeout_seconds
+    status = "UNKNOWN"
     while True:
-        status_output = run_zowe(["jobs", "view", "job-status-by-jobid", job_id, "--rfj"])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Job {job_id} for {job_target} did not complete within "
+                f"{job_timeout_seconds:g} seconds (last status: {status})."
+            )
+        status_output = run_zowe(
+            ["jobs", "view", "job-status-by-jobid", job_id, "--rfj"],
+            timeout=min(ZOWE_COMMAND_TIMEOUT_SECONDS, remaining),
+        )
         status = extract_status(status_output)
         if status in TERMINAL_STATUSES:
             break
-        time.sleep(POLL_INTERVAL_SECONDS)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Job {job_id} for {job_target} did not complete within "
+                f"{job_timeout_seconds:g} seconds (last status: {status})."
+            )
+        time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
     # Get final return code
     retcode = extract_retcode(status_output)
@@ -122,7 +183,11 @@ def process_job(job_target):
     job_dir.mkdir(parents=True, exist_ok=True)
     status_file = job_dir / "completion_status.txt"
     
-    success_flag = "SUCCESS" if retcode == "CC 0000" else "ATTENTION/FAILED"
+    success_flag = (
+        "SUCCESS"
+        if status in TERMINAL_STATUSES and retcode == "CC 0000"
+        else "ATTENTION/FAILED"
+    )
     with open(status_file, "w") as f:
         f.write("========================================\n")
         f.write(f"JOB TARGET:  {job_target}\n")
@@ -131,7 +196,12 @@ def process_job(job_target):
         f.write(f"RETURN CODE: {retcode} ({success_flag})\n")
         f.write("========================================\n")
     
-    return {"job_target": str(job_target), "job_id": job_id, "status": status, "retcode": retcode}
+    return {
+        "job_target": str(job_target),
+        "job_id": job_id,
+        "status": status,
+        "retcode": retcode,
+    }
 
 
 def main():
@@ -139,7 +209,26 @@ def main():
     parser.add_argument(
         "jobs",
         nargs="+",
-        help="List of local JCL files (e.g. audit.jcl) or mainframe datasets (e.g. Z83220.JCL(MYJOB))"
+        help=(
+            "Local JCL files or mainframe datasets. Existing files are submitted "
+            "locally; other targets are submitted as datasets. Use 'file:' or "
+            "'dsn:' to force a target type."
+        ),
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=positive_int,
+        default=DEFAULT_MAX_WORKERS,
+        help=f"Maximum jobs to run concurrently (default: {DEFAULT_MAX_WORKERS})",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_float,
+        default=DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=(
+            "Maximum seconds to wait for each submitted job to finish "
+            f"(default: {DEFAULT_JOB_TIMEOUT_SECONDS})"
+        ),
     )
     args = parser.parse_args()
 
@@ -149,17 +238,25 @@ def main():
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
 
-    results = []
-    with ThreadPoolExecutor(max_workers=len(args.jobs)) as executor:
-        futures = [executor.submit(process_job, job) for job in args.jobs]
-        
+    results = [None] * len(args.jobs)
+    with ThreadPoolExecutor(max_workers=min(args.max_workers, len(args.jobs))) as executor:
+        futures = {
+            executor.submit(process_job, job, args.timeout): (index, job)
+            for index, job in enumerate(args.jobs)
+        }
+
         for future in as_completed(futures):
+            index, job_target = futures[future]
             try:
-                result = future.result()
-                results.append(result)
+                results[index] = future.result()
             except Exception as exc:
-                print(f"Job failed: {exc}", file=sys.stderr)
-                results.append({"job_target": "ERROR", "job_id": "N/A", "status": "FAILED", "retcode": str(exc)})
+                print(f"Job {job_target} failed: {exc}", file=sys.stderr)
+                results[index] = {
+                    "job_target": str(job_target),
+                    "job_id": "N/A",
+                    "status": "FAILED",
+                    "retcode": str(exc),
+                }
 
     # Generate the Master Pipeline Report inside the "output" directory
     report_file = output_dir / "pipeline_report.txt"
@@ -168,7 +265,11 @@ def main():
         f.write("      CI/CD PIPELINE EXECUTION REPORT   \n")
         f.write("========================================\n\n")
         for res in results:
-            success_flag = "SUCCESS" if res["retcode"] == "CC 0000" else "ATTENTION/FAILED"
+            success_flag = (
+                "SUCCESS"
+                if res["status"] in TERMINAL_STATUSES and res["retcode"] == "CC 0000"
+                else "ATTENTION/FAILED"
+            )
             f.write(f"Target:      {res['job_target']}\n")
             f.write(f"Job ID:      {res['job_id']}\n")
             f.write(f"Status:      {res['status']}\n")
@@ -176,11 +277,17 @@ def main():
             f.write("-" * 40 + "\n")
             
     print(f"\nPipeline complete. Execution summary saved to {report_file.resolve()}")
+    return int(
+        any(
+            res["status"] not in TERMINAL_STATUSES or res["retcode"] != "CC 0000"
+            for res in results
+        )
+    )
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
