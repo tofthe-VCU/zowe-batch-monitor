@@ -16,6 +16,13 @@ POLL_INTERVAL_SECONDS = 5
 ZOWE_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_JOB_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_WORKERS = 4
+DEFAULT_LOCAL_JCL_DIRS = (Path("test_jobs"),)
+
+# Matches standard z/OS sequential datasets (HLQ.QUAL2.QUAL3) and PDS members (HLQ.PDS(MEMBER))
+ZOS_DATASET_PATTERN = re.compile(
+    r"^[A-Z@#$][A-Z0-9@#$]{0,7}(\.[A-Z@#$][A-Z0-9@#$]{0,7})*(\([A-Z@#$][A-Z0-9@#$]{0,7}\))?$",
+    re.IGNORECASE,
+)
 
 
 def positive_int(value):
@@ -38,6 +45,70 @@ def positive_float(value):
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive number")
     return parsed
+
+
+def is_valid_zos_dataset(name):
+    """Validate z/OS dataset naming rules (max 44 chars before member, 1-8 char qualifiers)."""
+    base_name = name.split("(", 1)[0]
+    if not base_name or len(base_name) > 44:
+        return False
+    return bool(ZOS_DATASET_PATTERN.match(name))
+
+
+def resolve_job_target(job_target):
+    """Resolve whether a target is a local JCL file or a valid z/OS dataset."""
+    raw = job_target.strip()
+    if not raw:
+        raise ValueError("Job target cannot be empty.")
+
+    if raw.startswith("dsn:"):
+        dataset = raw[4:].strip()
+        if not is_valid_zos_dataset(dataset):
+            raise ValueError(f"Invalid z/OS dataset name: '{dataset}'")
+        return "dataset", dataset
+
+    if raw.startswith("file:"):
+        file_str = raw[5:].strip()
+        target_path = Path(file_str).expanduser()
+        if not target_path.is_file():
+            raise FileNotFoundError(f"Local JCL file not found: {target_path}")
+        return "file", target_path
+
+    # Unprefixed target: check exact local path first
+    target_path = Path(raw).expanduser()
+    if target_path.is_file():
+        return "file", target_path
+    if target_path.exists():
+        raise FileNotFoundError(f"Local JCL target is not a file: {target_path}")
+
+    # Fallback: if a bare filename (e.g., 'audit_pipeline.jcl' or '.\audit_pipeline.jcl')
+    # was passed, check default local JCL directories like ./test_jobs/
+    if target_path.parent in (Path("."), Path("")):
+        for fallback_dir in DEFAULT_LOCAL_JCL_DIRS:
+            candidate = fallback_dir / target_path.name
+            if candidate.is_file():
+                return "file", candidate
+
+    # Reject obvious local paths or .jcl filenames instead of mistaking them for datasets
+    looks_like_local_path = (
+        "\\" in raw
+        or "/" in raw
+        or raw.startswith(".")
+        or raw.lower().endswith(".jcl")
+    )
+    if looks_like_local_path:
+        searched = ", ".join(str(d) for d in (Path("."), *DEFAULT_LOCAL_JCL_DIRS))
+        raise FileNotFoundError(
+            f"Local JCL file not found: '{raw}' (searched in: {searched}). "
+            "Use 'dsn:<DATASET>' if you intended a mainframe dataset."
+        )
+
+    if is_valid_zos_dataset(raw):
+        return "dataset", raw
+
+    raise ValueError(
+        f"Target '{raw}' was not found as a local file and is not a valid z/OS dataset name."
+    )
 
 
 def run_zowe(args, timeout=ZOWE_COMMAND_TIMEOUT_SECONDS):
@@ -120,27 +191,17 @@ def extract_retcode(output):
 
 def process_job(job_target, job_timeout_seconds):
     """Submit a single job, monitor it, extract the return code, and download the spool."""
-    explicit_dataset = job_target.startswith("dsn:")
-    explicit_file = job_target.startswith("file:")
-    target_text = job_target[5:] if explicit_file else job_target
-    target_path = Path(target_text).expanduser()
+    target_type, resolved_target = resolve_job_target(job_target)
 
-    if explicit_dataset or (not explicit_file and not target_path.exists()):
-        dataset = job_target[4:].strip() if explicit_dataset else job_target
-        if not dataset:
-            raise ValueError("Dataset target is empty.")
-        print(f"-> Submitting mainframe dataset: {dataset}")
+    if target_type == "dataset":
+        print(f"-> Submitting mainframe dataset: {resolved_target}")
         submit_output = run_zowe(
-            ["jobs", "submit", "data-set", dataset, "--rfj"]
+            ["jobs", "submit", "data-set", resolved_target, "--rfj"]
         )
     else:
-        if not target_path.is_file():
-            raise FileNotFoundError(
-                f"Local JCL target is not a file: {target_path}"
-            )
-        print(f"-> Submitting local file: {job_target}")
+        print(f"-> Submitting local file: {resolved_target}")
         submit_output = run_zowe(
-            ["jobs", "submit", "local-file", str(target_path), "--rfj"]
+            ["jobs", "submit", "local-file", str(resolved_target), "--rfj"]
         )
 
     job_id = extract_job_id(submit_output)
@@ -177,12 +238,12 @@ def process_job(job_target, job_timeout_seconds):
     # Download spool directly into the "output" directory
     run_zowe(["jobs", "download", "output", job_id, "-d", "output"])
     print(f"[{job_id}] Spool downloaded successfully into output/{job_id}")
-    
+
     # Generate individual job status file inside the downloaded spool folder
     job_dir = Path("output") / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     status_file = job_dir / "completion_status.txt"
-    
+
     success_flag = (
         "SUCCESS"
         if status in TERMINAL_STATUSES and retcode == "CC 0000"
@@ -190,14 +251,14 @@ def process_job(job_target, job_timeout_seconds):
     )
     with open(status_file, "w") as f:
         f.write("========================================\n")
-        f.write(f"JOB TARGET:  {job_target}\n")
+        f.write(f"JOB TARGET:  {resolved_target}\n")
         f.write(f"JOB ID:      {job_id}\n")
         f.write(f"STATUS:      {status}\n")
         f.write(f"RETURN CODE: {retcode} ({success_flag})\n")
         f.write("========================================\n")
-    
+
     return {
-        "job_target": str(job_target),
+        "job_target": str(resolved_target),
         "job_id": job_id,
         "status": status,
         "retcode": retcode,
@@ -210,9 +271,8 @@ def main():
         "jobs",
         nargs="+",
         help=(
-            "Local JCL files or mainframe datasets. Existing files are submitted "
-            "locally; other targets are submitted as datasets. Use 'file:' or "
-            "'dsn:' to force a target type."
+            "Local JCL files (checked in current dir and ./test_jobs) or mainframe "
+            "datasets. Use 'file:' or 'dsn:' to force a target type."
         ),
     )
     parser.add_argument(
@@ -275,7 +335,7 @@ def main():
             f.write(f"Status:      {res['status']}\n")
             f.write(f"Return Code: {res['retcode']} ({success_flag})\n")
             f.write("-" * 40 + "\n")
-            
+
     print(f"\nPipeline complete. Execution summary saved to {report_file.resolve()}")
     return int(
         any(
